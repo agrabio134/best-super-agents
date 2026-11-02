@@ -1,0 +1,11 @@
+{
+  "name": "best-super-agents",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "22.x" },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
+  }
+}
