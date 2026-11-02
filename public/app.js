@@ -783,9 +783,8 @@ function renderLayer() {
     const st = S.status || {}; const row = (ok, t, d) => `<li><span class="ck ${ok ? 'yes' : 'no'}">${ok ? ic('check') : ''}</span><div><b>${t}</b><p>${d}</p></div></li>`;
     html = dialog({ wide: true, title: 'Service status', eyebrowTxt: 'Live services', body: `<ul class="setup-list">
       ${row(st.db, 'Database', st.db ? 'Connected. Agents, runs and rewards are stored.' : 'Not connected. Add Neon Postgres to the Vercel project (Storage → Neon), which sets <code>DATABASE_URL</code>, then redeploy.')}
-      ${row(st.ai, 'AI provider', st.ai ? `Connected · ${esc(st.model)}` : 'Not connected. Add <code>ANTHROPIC_API_KEY</code> in Vercel → Settings → Environment Variables, then redeploy.')}
+      ${row(st.ai, 'AI provider', st.ai ? `Connected · ${esc(st.model)}` : 'Not connected. Add <code>GROQ_API_KEY</code> (or <code>ANTHROPIC_API_KEY</code>) in Vercel → Settings → Environment Variables, then redeploy.')}
       ${row(st.session !== false, 'Sessions', 'Signed session cookies use <code>SESSION_SECRET</code>.')}
-      ${row(st.adminConfigured, 'Rewards admins', st.adminConfigured ? 'Admin wallets are set.' : 'Optional. Add wallet addresses to <code>ADMIN_WALLETS</code> (comma-separated) to review rewards.')}
       ${row(st.claims, 'Claim program', st.claims ? 'Configured.' : 'Not deployed yet. Claims stay closed until a Solana claim program is connected.')}</ul>` });
   } else if (m.type === 'leave') {
     html = dialog({ title: 'Leave with unsaved changes?', body: `<p>${uploadingAny() ? 'A file is still uploading. Leaving now cancels it.' : `Your latest changes couldn't be saved${S.save.error ? `: ${esc(S.save.error)}` : '.'} They stay in this tab, but will be lost if you close it.`}</p>`,

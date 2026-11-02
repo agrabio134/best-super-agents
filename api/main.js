@@ -8,8 +8,11 @@ import crypto from 'node:crypto';
 const DB_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
 const sql = globalThis.__BSA_SQL__ || (DB_URL ? neon(DB_URL) : null);
 const SECRET = process.env.SESSION_SECRET || '';
-const AI_KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+const GROQ_KEY = process.env.GROQ_API_KEY || '';
+const PROVIDER = (process.env.AI_PROVIDER || (GROQ_KEY && !ANTHROPIC_KEY ? 'groq' : ANTHROPIC_KEY ? 'anthropic' : GROQ_KEY ? 'groq' : '')).toLowerCase();
+const AI_KEY = PROVIDER === 'groq' ? GROQ_KEY : PROVIDER === 'anthropic' ? ANTHROPIC_KEY : '';
+const MODEL = PROVIDER === 'groq' ? (process.env.GROQ_MODEL || 'openai/gpt-oss-120b') : (process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5');
 const RUNS_PER_HOUR = Number(process.env.RUNS_PER_HOUR || 20);
 const ADMIN_WALLETS = (process.env.ADMIN_WALLETS || '').split(',').map(s => s.trim()).filter(Boolean);
 const CLAIM_CONTRACT = process.env.CLAIM_PROGRAM_ID || '';
@@ -82,7 +85,7 @@ async function getConfig() {
   return { ...DEFAULT_CONFIG, ...v, programs: { ...DEFAULT_CONFIG.programs, ...(v.programs || {}) }, caps: { ...DEFAULT_CONFIG.caps, ...(v.caps || {}) }, token: DEFAULT_CONFIG.token };
 }
 function statusInfo(u) {
-  return { db: !!sql, ai: !!AI_KEY, session: !!SECRET, model: AI_KEY ? MODEL : null, claims: !!CLAIM_CONTRACT, adminConfigured: ADMIN_WALLETS.length > 0, admin: isAdmin(u) };
+  return { db: !!sql, ai: !!AI_KEY, session: !!SECRET, model: AI_KEY ? MODEL : null, claims: !!CLAIM_CONTRACT, admin: isAdmin(u) };
 }
 function shapeRun(r) {
   let status = r.status, error = r.error;
@@ -119,6 +122,36 @@ function publishProblems(d) {
 }
 
 /* ---------------- Claude execution ---------------- */
+function callAI(o) { return PROVIDER === 'groq' ? callGroq(o) : callClaude(o); }
+
+// Groq (OpenAI-compatible). Web search uses the built-in browser_search tool on GPT-OSS models.
+async function callGroq({ system, user, search, signal }) {
+  const canSearch = search && /gpt-oss/.test(MODEL);
+  const body = { model: MODEL, max_completion_tokens: 3000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], ...(canSearch ? { tools: [{ type: 'browser_search' }], tool_choice: 'required' } : {}) };
+  let r, attempt = 0;
+  while (true) {
+    r = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', signal, headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    if (r.status === 429 && attempt < 2) { attempt++; const wait = Math.min(8000, (Number(r.headers.get('retry-after')) || 3) * 1000); await new Promise(res => setTimeout(res, wait)); continue; }
+    break;
+  }
+  const raw = await r.text();
+  if (!r.ok) {
+    let msg = raw; try { msg = JSON.parse(raw).error?.message || raw; } catch {}
+    throw new Error(r.status === 401 ? 'The AI provider rejected the API key. Check GROQ_API_KEY.' : r.status === 429 ? 'Groq is rate limiting requests (free tier limits). Try again in a minute.' : `AI provider error (${r.status}): ${clip(msg, 200)}`);
+  }
+  const j = JSON.parse(raw); const m = j.choices?.[0]?.message || {};
+  const text = String(m.content || '').replace(/【[^】]*】/g, '').trim();
+  const sources = []; const seen = new Set();
+  const walk = (v, depth = 0) => {
+    if (!v || depth > 8) return;
+    if (Array.isArray(v)) return v.forEach(x => walk(x, depth + 1));
+    if (typeof v === 'object') { if (typeof v.url === 'string' && /^https?:\/\//.test(v.url) && !seen.has(v.url)) { seen.add(v.url); sources.push({ url: v.url, title: v.title || v.url }); } for (const k in v) walk(v[k], depth + 1); return; }
+    if (typeof v === 'string' && v.startsWith('{')) { try { walk(JSON.parse(v), depth + 1); } catch {} }
+  };
+  walk(m.executed_tools);
+  return { text, sources, usage: { input: j.usage?.prompt_tokens || 0, output: j.usage?.completion_tokens || 0 } };
+}
+
 async function callClaude({ system, user, search, signal }) {
   let messages = [{ role: 'user', content: user }]; let blocks = []; let usage = { input: 0, output: 0 };
   const tools = search ? [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }] : undefined;
@@ -146,7 +179,7 @@ async function callClaude({ system, user, search, signal }) {
 async function handleRun(req, res, u) {
   const b = req.body || {}; const input = clip(b.input, 2000).trim();
   if (input.length < 3) throw new HttpError(400, 'Describe a task of at least 3 characters.');
-  if (!AI_KEY) throw new HttpError(503, 'Runs are not available yet: the AI provider key has not been added (ANTHROPIC_API_KEY).');
+  if (!AI_KEY) throw new HttpError(503, 'Runs are not available yet: no AI provider key has been added (GROQ_API_KEY or ANTHROPIC_API_KEY).');
   let row, source;
   if (b.agentId) {
     const r = await sql`select * from agents where id = ${b.agentId} and owner_id = ${u.id}`; row = r[0]; source = 'Test';
@@ -196,7 +229,7 @@ async function handleRun(req, res, u) {
         `Current step: ${s.title}\n${s.desc}${s.settings.instructions ? `\nStep instructions: ${s.settings.instructions}` : ''}`].filter(Boolean).join('\n\n');
       let attempt = 0, out = null;
       while (true) {
-        try { out = await callClaude({ system, user, search: wantSearch, signal: ctrl.signal }); break; }
+        try { out = await callAI({ system, user, search: wantSearch, signal: ctrl.signal }); break; }
         catch (e) {
           if (ctrl.signal.aborted) throw e;
           if (s.settings.onFail === 'retry' && attempt === 0) { attempt++; steps[i].note = 'Failed once, retrying.'; send({ type: 'step', i, step: steps[i] }); continue; }

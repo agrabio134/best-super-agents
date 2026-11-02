@@ -12,8 +12,11 @@ Create, test, publish and manage AI agents through guided steps.
 |---|---|---|
 | `DATABASE_URL` | yes | Neon Postgres (set automatically by the Vercel Neon integration) |
 | `SESSION_SECRET` | yes | Signs session cookies |
-| `ANTHROPIC_API_KEY` | yes, for runs | Claude API key |
+| `GROQ_API_KEY` | one AI key needed | Groq API key (uses `openai/gpt-oss-120b` with built-in browser search) |
+| `GROQ_MODEL` | no | Defaults to `openai/gpt-oss-120b` |
+| `ANTHROPIC_API_KEY` | one AI key needed | Claude API key |
 | `ANTHROPIC_MODEL` | no | Defaults to `claude-sonnet-5-5` |
+| `AI_PROVIDER` | no | `groq` or `anthropic` when both keys are set (default: anthropic) |
 | `ADMIN_WALLETS` | no | Comma-separated Solana addresses that can review rewards |
 | `RUNS_PER_HOUR` | no | Per-user run limit, default 20 |
 | `CLAIM_PROGRAM_ID` | no | Enables claims once a Solana claim program exists |
