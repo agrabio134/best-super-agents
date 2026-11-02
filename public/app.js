@@ -584,6 +584,7 @@ function strip(sel, live, key) {
   if (live) {
     if (live.pending) return `<div class="strip st-running" role="status"><span class="spin" aria-hidden="true"></span><span class="grow"><b>Starting</b> · connecting to the run service</span><button class="btn btn-sm btn-on-dark" data-act="cancel-run">${ic('stop')} Cancel</button></div>`;
     const i = live.steps.findIndex(s => s.status === 'running'); const c = live.steps[i];
+    if (S.run?.reconnecting) return `<div class="strip st-running" role="status"><span class="spin" aria-hidden="true"></span><span class="grow"><b>Reconnecting</b> · the run continues on the server</span><button class="btn btn-sm btn-on-dark" data-act="cancel-run">${ic('stop')} Cancel</button></div>`;
     return `<div class="strip st-running" role="status"><span class="grow"><b>Running</b> · Step ${i + 1} of ${live.steps.length}${c ? ` · ${esc(c.title)}` : ''}</span><button class="btn btn-sm btn-on-dark" data-act="cancel-run">${ic('stop')} Cancel</button>
       <div class="segs" aria-hidden="true">${live.steps.map(s => `<i class="${s.status === 'done' || s.status === 'skipped' ? 'done' : s.status === 'running' ? 'running' : ''}"></i>`).join('')}</div></div>`;
   }
@@ -948,6 +949,22 @@ function captureStepFlip() { const m = new Map(); $$('.step-item').forEach(el =>
 function playStepFlip(m) { if (reduceMotion()) return; $$('.step-item').forEach(el => { const t = m.get(el.dataset.stepId); if (t == null) return; const d = t - el.getBoundingClientRect().top; if (Math.abs(d) > 1) el.animate([{ transform: `translateY(${d}px)` }, { transform: 'none' }], { duration: 220, easing: 'cubic-bezier(.2,.7,.2,1)' }); }); }
 
 /* ---------- Runs (Server-Sent Events over fetch) ---------- */
+// If the live connection drops, the run keeps going on the server; follow it by polling until it ends.
+async function followRun(rec, ctrl) {
+  S.run.reconnecting = true; render(null, { stick: true });
+  let misses = 0;
+  while (!ctrl.signal.aborted) {
+    await new Promise(r => setTimeout(r, 2500));
+    if (ctrl.signal.aborted) break;
+    try {
+      const j = await api('runs/' + rec.id); misses = 0; const r = j.run;
+      rec.steps = r.steps; rec.status = r.status; rec.output = r.output; rec.error = r.error; rec.endedAt = r.endedAt;
+      S.run.reconnecting = false; render(null, { stick: true });
+      if (r.status !== 'running') return;
+    } catch { if (++misses >= 12) { rec.status = 'failed'; rec.error = "Lost contact with the run. Open Activity later to see whether it finished."; rec.endedAt = Date.now(); return; } }
+  }
+  throw new DOMException('Aborted', 'AbortError');
+}
 async function startRun(key, agentId, input) {
   if (S.run) { toast('A run is already in progress. Cancel it or wait for it to finish.'); return; }
   const ctrl = new AbortController(); S.run = { key, agentId, rec: null, controller: ctrl, input }; S.runError[key] = null; S.chat[key] = '';
@@ -969,9 +986,11 @@ async function startRun(key, agentId, input) {
         render(null, { stick: true });
       }
     }
-    if (rec && !ended) { rec.status = 'failed'; rec.error = 'The connection closed before the run finished. Check Activity in a moment for the final result.'; rec.endedAt = Date.now(); }
+    if (rec && !ended) await followRun(rec, ctrl);
   } catch (e) {
-    if (e.name === 'AbortError') { if (rec) { rec.status = 'cancelled'; rec.endedAt = Date.now(); rec.steps.forEach(s => { if (s.status === 'running') s.status = 'cancelled'; else if (s.status === 'queued') s.status = 'skipped'; }); } toast('Run cancelled.'); }
+    if (e.name !== 'AbortError' && rec && !e.pre && rec.status === 'running') { try { await followRun(rec, ctrl); e = null; } catch (e2) { e = e2; } }
+    if (!e) {}
+    else if (e.name === 'AbortError') { if (rec) { rec.status = 'cancelled'; rec.endedAt = Date.now(); rec.steps.forEach(s => { if (s.status === 'running') s.status = 'cancelled'; else if (s.status === 'queued') s.status = 'skipped'; }); } toast('Run cancelled.'); }
     else if (e.pre || !rec) { S.runError[key] = { msg: e.message, wallet: e.status === 403 && key === 'dir' }; S.chat[key] = input; }
     else { rec.status = 'failed'; rec.error = e.message; rec.endedAt = Date.now(); }
   }
@@ -1146,7 +1165,7 @@ const H = {
   'file-remove': async el => { const a = cur(); const f = a.files.find(x => x.id === el.dataset.id); if (f.status === 'done') { try { await api('files/' + f.id, { method: 'DELETE' }); } catch (e) { toast(e.message, { tone: 'bad' }); return; } }
     a.files = a.files.filter(x => x.id !== f.id); fileObjects.delete(f.id); liveValidate(); render(); $('#f-files')?.focus(); },
   tab: el => { S.tab[el.dataset.key] = el.dataset.v; render(); $(`#tab-${el.dataset.key}-${el.dataset.v}`)?.focus(); },
-  'cancel-run': () => S.run?.controller.abort(),
+  'cancel-run': () => { const id = S.run?.rec?.id; if (id) api(`runs/${id}/cancel`, { method: 'POST' }).catch(() => {}); S.run?.controller.abort(); },
   'retry-run': el => { const r = S.runs.find(x => x.id === el.dataset.id); if (!r) return; S.chat[el.dataset.key] = r.input; requestRun(el.dataset.key); },
   'use-sample': el => { const key = el.dataset.key || 'studio'; S.chat[key] = el.dataset.v; S.runError[key] = null; if (isPhone() && key === 'studio') S.mobileView = 'preview'; render(); const t = $('#in-' + key); t?.focus(); try { t.setSelectionRange(t.value.length, t.value.length); } catch {} },
   'open-output': el => { S.selectedRun[el.dataset.key] = el.dataset.id; S.tab[el.dataset.key] = 'output'; render(); $(`#tab-${el.dataset.key}-output`)?.focus(); },

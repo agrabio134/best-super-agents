@@ -61,6 +61,7 @@ function ensureSchema() {
     await sql`create index if not exists runs_agent on runs(agent_id)`;
     await sql`create index if not exists runs_user on runs(user_id)`;
     await sql`create index if not exists runs_owner on runs(agent_owner)`;
+    await sql`alter table runs add column if not exists cancel_requested boolean default false`;
     await sql`create table if not exists events(id text primary key, user_id text not null, t timestamptz default now(), text text, tone text)`;
     await sql`create index if not exists events_user on events(user_id)`;
     await sql`create table if not exists rewards(id text primary key, user_id text not null, agent_id text, agent_name text, type text, status text, amount numeric, reason text, period text, created_at timestamptz default now(), updated_at timestamptz default now())`;
@@ -127,6 +128,7 @@ function callAI(o) { return PROVIDER === 'groq' ? callGroq(o) : callClaude(o); }
 // Groq (OpenAI-compatible). Free tier = 8K tokens/minute per model, so requests rotate across a pool of models,
 // each with its own limit. Web search (browser_search) is only available on GPT-OSS models.
 const GROQ_POOL = (process.env.GROQ_MODELS || `${MODEL},openai/gpt-oss-20b,qwen/qwen3.8-27b`).split(',').map(x => x.trim()).filter((x, i, a) => x && a.indexOf(x) === i);
+const LIVE_RUNS = new Map(); // runId -> AbortController (same warm instance)
 const groqCooldown = new Map(); // model -> time it may be used again (per warm function instance)
 const sleepMs = (ms, signal) => new Promise((res, rej) => { const t = setTimeout(res, ms); signal?.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); }, { once: true }); });
 function parseReset(v) { // "7.66s", "1m2.5s", "350ms", "12"
@@ -148,8 +150,9 @@ function parseGroq(j) {
   walk(m.executed_tools);
   return { text, sources, usage: { input: j.usage?.prompt_tokens || 0, output: j.usage?.completion_tokens || 0 } };
 }
-async function callGroq({ system, user, search, last, signal, onWait }) {
-  const deadline = Date.now() + 75000; let noSearch = false; let lastErr = '';
+function fitText(str, n) { if (str.length <= n) return str; const h = Math.floor(n * 0.6); return str.slice(0, h) + '\n…[shortened to fit the free tier]…\n' + str.slice(-(n - h)); }
+async function callGroq({ system, user, search, last, signal, onWait, shouldStop }) {
+  const deadline = Date.now() + 150000; let noSearch = false; let lastErr = ''; let maxTok = last ? 2200 : 1100; let shrinks = 0;
   while (true) {
     const now = Date.now();
     // search steps prefer GPT-OSS (browser_search); fall back to any model after waiting too long
@@ -161,10 +164,11 @@ async function callGroq({ system, user, search, last, signal, onWait }) {
       const wait = Math.max(500, Math.min(...pool.map(m => (groqCooldown.get(m) || now) - now)) + 300);
       if (now + wait > deadline) throw new Error('The free AI tier is busy right now. Wait about a minute, then press Retry.');
       onWait?.(`Free tier limit reached. Retrying in ${Math.ceil(wait / 1000)}s…`);
-      await sleepMs(wait, signal); continue;
+      for (let left = wait; left > 0; left -= 2000) { await sleepMs(Math.min(2000, left), signal); if (await shouldStop?.()) throw new DOMException('Aborted', 'AbortError'); }
+      continue;
     }
     const model = ready[0]; const useSearch = search && !noSearch && /gpt-oss/.test(model);
-    const body = { model, max_completion_tokens: last ? 2200 : 1100, temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    const body = { model, max_completion_tokens: maxTok, temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       ...(useSearch ? { tools: [{ type: 'browser_search' }], tool_choice: 'required' } : {}) };
     const r = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', signal, headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
     const raw = await r.text(); let j = null; try { j = JSON.parse(raw); } catch {}
@@ -173,7 +177,14 @@ async function callGroq({ system, user, search, last, signal, onWait }) {
     if (r.status === 401) throw new Error('The AI provider rejected the API key. Check GROQ_API_KEY.');
     if (r.status === 413 || /too large|reduce your message size|context length/i.test(msg)) {
       if (useSearch) { noSearch = true; continue; } // search results pushed it over; retry without search
-      throw new Error('This step has too much text for the free AI tier. Shorten the instructions or attached files.');
+      if (shrinks >= 4) throw new Error('This step has too much text for the free AI tier, even after shortening. Shorten the instructions or attached files.');
+      // e.g. "Limit 8000, Requested 9420": shrink the prompt so input + answer fit the per-request limit
+      const lim = Number((msg.match(/Limit\s*(\d+)/i) || [])[1]) || 8000; const req = Number((msg.match(/Requested\s*(\d+)/i) || [])[1]) || 0;
+      const oldMax = maxTok; maxTok = Math.min(maxTok, last ? 1500 : 800);
+      const inputTok = req ? Math.max(1, req - oldMax) : 0;
+      const ratio = Math.max(0.2, Math.min(0.75 - shrinks * 0.15, inputTok ? (lim - maxTok - 600) / inputTok : 0.6));
+      system = fitText(system, Math.floor(system.length * ratio)); user = fitText(user, Math.floor(user.length * ratio)); shrinks++;
+      onWait?.('Shortening the input to fit the free tier…'); continue;
     }
     if (r.status === 429) {
       const tpd = /per day|TPD|RPD/i.test(msg);
@@ -236,21 +247,27 @@ async function handleRun(req, res, u) {
   res.statusCode = 200;
   res.setHeader('content-type', 'text/event-stream'); res.setHeader('cache-control', 'no-store, no-transform'); res.setHeader('x-accel-buffering', 'no');
   const send = o => { try { res.write(`data: ${JSON.stringify(o)}\n\n`); } catch {} };
-  const ctrl = new AbortController(); let finished = false;
-  res.on('close', () => { if (!finished) ctrl.abort(); });
+  const ctrl = new AbortController(); let finished = false; let lastSave = 0;
+  // The run continues if the browser disconnects; the page reconnects by polling /api/runs/:id. Cancel is explicit.
+  LIVE_RUNS.set(runId, ctrl);
+  const beat = setInterval(() => { try { res.write(': keep-alive\n\n'); } catch {} }, 8000);
+  const persist = async (force) => { if (!force && Date.now() - lastSave < 1500) return; lastSave = Date.now(); try { await sql`update runs set steps = ${JSON.stringify(steps)} where id = ${runId}`; } catch {} };
+  const shouldStop = async () => { if (ctrl.signal.aborted) return true; try { const r = await sql`select cancel_requested from runs where id = ${runId}`; if (r[0]?.cancel_requested) { ctrl.abort(); return true; } } catch {} return false; };
+  const send0 = send; const sendP = o => { send0(o); if (o.type === 'step') persist(o.step.status !== 'running'); };
   const started = Date.now();
   send({ type: 'start', run: { id: runId, agentId: row.id, agentName: d.name, source, input, status: 'running', steps, startedAt: started, model: MODEL } });
 
   let knowledge = '';
   if (d.tools.knowledge) {
     const f = await sql`select name, body from files where agent_id = ${row.id} order by created_at`;
-    let budget = PROVIDER === 'groq' ? 16000 : 120000; for (const x of f) { const t = clip(x.body, budget); budget -= t.length; knowledge += `\n--- File: ${x.name} ---\n${t}\n`; if (budget <= 0) break; }
+    let budget = PROVIDER === 'groq' ? 10000 : 120000; for (const x of f) { const t = clip(x.body, budget); budget -= t.length; knowledge += `\n--- File: ${x.name} ---\n${t}\n`; if (budget <= 0) break; }
   }
   const allSources = []; const outputs = []; let status = 'completed', error = null, finalText = '';
   try {
     for (let i = 0; i < d.steps.length; i++) {
+      if (await shouldStop()) throw new DOMException('Aborted', 'AbortError');
       const s = d.steps[i]; const last = i === d.steps.length - 1;
-      steps[i].status = 'running'; steps[i].startedAt = Date.now(); send({ type: 'step', i, step: steps[i] });
+      steps[i].status = 'running'; steps[i].startedAt = Date.now(); sendP({ type: 'step', i, step: steps[i] });
       const wantSearch = (d.tools.search || d.tools.browse) && (s.settings.tool === 'search' || s.settings.tool === 'browse' || (s.settings.tool === 'auto' && (s.kind === 'search' || /search|find|source|research|look up/i.test(s.title))));
       const system = [
         `You are "${d.name || 'an agent'}", an AI agent published on Best Super Agents.`,
@@ -267,12 +284,12 @@ async function handleRun(req, res, u) {
         `Current step: ${s.title}\n${s.desc}${s.settings.instructions ? `\nStep instructions: ${s.settings.instructions}` : ''}`].filter(Boolean).join('\n\n');
       let attempt = 0, out = null;
       while (true) {
-        try { out = await callAI({ system, user, search: wantSearch, last, signal: ctrl.signal, onWait: note => { steps[i].note = note; send({ type: 'step', i, step: steps[i] }); } }); break; }
+        try { out = await callAI({ system, user, search: wantSearch, last, signal: ctrl.signal, onWait: note => { steps[i].note = note; sendP({ type: 'step', i, step: steps[i] }); }, shouldStop }); break; }
         catch (e) {
           if (ctrl.signal.aborted) throw e;
-          if (s.settings.onFail === 'retry' && attempt === 0) { attempt++; steps[i].note = 'Failed once, retrying.'; send({ type: 'step', i, step: steps[i] }); continue; }
-          if (s.settings.onFail === 'skip' && !last) { steps[i].status = 'skipped'; steps[i].note = `Skipped after an error: ${clip(e.message, 160)}`; steps[i].endedAt = Date.now(); send({ type: 'step', i, step: steps[i] }); out = null; break; }
-          steps[i].status = 'failed'; steps[i].endedAt = Date.now(); steps[i].note = clip(e.message, 300); send({ type: 'step', i, step: steps[i] });
+          if (s.settings.onFail === 'retry' && attempt === 0) { attempt++; steps[i].note = 'Failed once, retrying.'; sendP({ type: 'step', i, step: steps[i] }); continue; }
+          if (s.settings.onFail === 'skip' && !last) { steps[i].status = 'skipped'; steps[i].note = `Skipped after an error: ${clip(e.message, 160)}`; steps[i].endedAt = Date.now(); sendP({ type: 'step', i, step: steps[i] }); out = null; break; }
+          steps[i].status = 'failed'; steps[i].endedAt = Date.now(); steps[i].note = clip(e.message, 300); sendP({ type: 'step', i, step: steps[i] });
           throw new Error(`“${s.title}” failed: ${e.message}`);
         }
       }
@@ -282,14 +299,14 @@ async function handleRun(req, res, u) {
         steps[i].note = out.sources.length ? `Searched the web · ${out.sources.length} result${out.sources.length === 1 ? '' : 's'}` : (out.note || undefined);
         if (out.model && out.model !== MODEL) steps[i].note = [steps[i].note, `ran on ${out.model}`].filter(Boolean).join(' · ');
         if (last) finalText = out.text;
-        send({ type: 'step', i, step: steps[i] });
+        sendP({ type: 'step', i, step: steps[i] });
       } else outputs.push('(step skipped)');
     }
   } catch (e) {
     if (ctrl.signal.aborted) { status = 'cancelled'; steps.forEach(x => { if (x.status === 'running') { x.status = 'cancelled'; x.endedAt = Date.now(); } else if (x.status === 'queued') x.status = 'skipped'; }); }
     else { status = 'failed'; error = clip(e.message, 500); steps.forEach(x => { if (x.status === 'queued') x.status = 'skipped'; }); }
   }
-  finished = true;
+  finished = true; clearInterval(beat); LIVE_RUNS.delete(runId);
   const seen = new Set(); const sources = allSources.filter(s => !seen.has(s.url) && seen.add(s.url)).slice(0, 20);
   const output = status === 'completed' ? { markdown: finalText, sources } : null;
   await sql`update runs set status = ${status}, steps = ${JSON.stringify(steps)}, output = ${output ? JSON.stringify(output) : null}, error = ${error}, ended_at = now() where id = ${runId}`;
@@ -307,7 +324,7 @@ async function route(req, res) {
   await ensureSchema();
   const sess = await getUser(req);
   const u = sess?.wallet ? sess : null;
-  const authed = /^(agents|files|run|admin)(\/|$)/.test(p);
+  const authed = /^(agents|files|runs?|admin)(\/|$)/.test(p);
   if (authed) needWallet(u);
 
   if (p === 'status') return json(res, 200, { status: statusInfo(u) });
@@ -433,6 +450,14 @@ async function route(req, res) {
 
   /* Runs */
   if (p === 'run' && m === 'POST') return handleRun(req, res, u);
+  if (parts[0] === 'runs' && isId(parts[1])) {
+    const r = await sql`select * from runs where id = ${parts[1]} and user_id = ${u.id}`; if (!r[0]) throw new HttpError(404, 'Run not found.');
+    if (parts[2] === 'cancel' && m === 'POST') {
+      await sql`update runs set cancel_requested = true where id = ${parts[1]}`; LIVE_RUNS.get(parts[1])?.abort();
+      return json(res, 200, { ok: true });
+    }
+    if (parts.length === 2 && m === 'GET') return json(res, 200, { run: shapeRun(r[0]) });
+  }
 
   /* Discover */
   if (p === 'directory' && m === 'GET') {
