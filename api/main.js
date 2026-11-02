@@ -257,7 +257,9 @@ async function handleRun(req, res, u) {
         `Agent purpose: ${d.goal}`,
         `Creator instructions:\n${d.instructions}`,
         knowledge ? `Reference files attached by the creator:\n${knowledge}` : '',
+        `Today's date is ${new Date().toISOString().slice(0, 10)}.`,
         `You are running step ${i + 1} of ${d.steps.length} in a fixed workflow. Do only this step.`,
+        wantSearch ? 'Use at most two focused web searches. Report only the key findings in under 250 words, each with its source URL.' : '',
         last ? 'This is the final step. Produce the finished deliverable for the user in clear Markdown. Cite sources inline when you used web search.' : 'Your output is passed to the next step as working notes. Be concise and factual.',
         'You cannot send messages, make purchases or call external services. If the task needs that, say what you would need instead.',
       ].filter(Boolean).join('\n\n');
