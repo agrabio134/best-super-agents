@@ -124,22 +124,19 @@ function publishProblems(d) {
 /* ---------------- Claude execution ---------------- */
 function callAI(o) { return PROVIDER === 'groq' ? callGroq(o) : callClaude(o); }
 
-// Groq (OpenAI-compatible). Web search uses the built-in browser_search tool on GPT-OSS models.
-async function callGroq({ system, user, search, signal }) {
-  const canSearch = search && /gpt-oss/.test(MODEL);
-  const body = { model: MODEL, max_completion_tokens: 3000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], ...(canSearch ? { tools: [{ type: 'browser_search' }], tool_choice: 'required' } : {}) };
-  let r, attempt = 0;
-  while (true) {
-    r = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', signal, headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    if (r.status === 429 && attempt < 2) { attempt++; const wait = Math.min(8000, (Number(r.headers.get('retry-after')) || 3) * 1000); await new Promise(res => setTimeout(res, wait)); continue; }
-    break;
-  }
-  const raw = await r.text();
-  if (!r.ok) {
-    let msg = raw; try { msg = JSON.parse(raw).error?.message || raw; } catch {}
-    throw new Error(r.status === 401 ? 'The AI provider rejected the API key. Check GROQ_API_KEY.' : r.status === 429 ? 'Groq is rate limiting requests (free tier limits). Try again in a minute.' : `AI provider error (${r.status}): ${clip(msg, 200)}`);
-  }
-  const j = JSON.parse(raw); const m = j.choices?.[0]?.message || {};
+// Groq (OpenAI-compatible). Free tier = 8K tokens/minute per model, so requests rotate across a pool of models,
+// each with its own limit. Web search (browser_search) is only available on GPT-OSS models.
+const GROQ_POOL = (process.env.GROQ_MODELS || `${MODEL},openai/gpt-oss-20b,qwen/qwen3.8-27b`).split(',').map(x => x.trim()).filter((x, i, a) => x && a.indexOf(x) === i);
+const groqCooldown = new Map(); // model -> time it may be used again (per warm function instance)
+const sleepMs = (ms, signal) => new Promise((res, rej) => { const t = setTimeout(res, ms); signal?.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')); }, { once: true }); });
+function parseReset(v) { // "7.66s", "1m2.5s", "350ms", "12"
+  if (!v) return 0; if (/^\d+(\.\d+)?$/.test(v)) return Number(v) * 1000;
+  let ms = 0; const re = /(\d+(?:\.\d+)?)(ms|h|m|s)/g; let m;
+  while ((m = re.exec(v))) ms += Number(m[1]) * { ms: 1, s: 1000, m: 60000, h: 3600000 }[m[2]];
+  return ms;
+}
+function parseGroq(j) {
+  const m = j.choices?.[0]?.message || {};
   const text = String(m.content || '').replace(/【[^】]*】/g, '').trim();
   const sources = []; const seen = new Set();
   const walk = (v, depth = 0) => {
@@ -150,6 +147,45 @@ async function callGroq({ system, user, search, signal }) {
   };
   walk(m.executed_tools);
   return { text, sources, usage: { input: j.usage?.prompt_tokens || 0, output: j.usage?.completion_tokens || 0 } };
+}
+async function callGroq({ system, user, search, last, signal, onWait }) {
+  const deadline = Date.now() + 75000; let noSearch = false; let lastErr = '';
+  while (true) {
+    const now = Date.now();
+    // search steps prefer GPT-OSS (browser_search); fall back to any model after waiting too long
+    const searchPool = GROQ_POOL.filter(m => /gpt-oss/.test(m));
+    const pool = search && !noSearch && searchPool.length ? searchPool : GROQ_POOL;
+    if (search && !noSearch && pool.every(m => (groqCooldown.get(m) || 0) - now > 20000)) { noSearch = true; continue; }
+    const ready = pool.filter(m => (groqCooldown.get(m) || 0) <= now);
+    if (!ready.length) {
+      const wait = Math.max(500, Math.min(...pool.map(m => (groqCooldown.get(m) || now) - now)) + 300);
+      if (now + wait > deadline) throw new Error('The free AI tier is busy right now. Wait about a minute, then press Retry.');
+      onWait?.(`Free tier limit reached. Retrying in ${Math.ceil(wait / 1000)}s…`);
+      await sleepMs(wait, signal); continue;
+    }
+    const model = ready[0]; const useSearch = search && !noSearch && /gpt-oss/.test(model);
+    const body = { model, max_completion_tokens: last ? 2200 : 1100, temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      ...(useSearch ? { tools: [{ type: 'browser_search' }], tool_choice: 'required' } : {}) };
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', signal, headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const raw = await r.text(); let j = null; try { j = JSON.parse(raw); } catch {}
+    if (r.ok) { const out = parseGroq(j); out.model = model; if (!useSearch && search) out.note = 'Web search unavailable on this model; answered from model knowledge'; return out; }
+    const msg = j?.error?.message || raw; lastErr = msg;
+    if (r.status === 401) throw new Error('The AI provider rejected the API key. Check GROQ_API_KEY.');
+    if (r.status === 413 || /too large|reduce your message size|context length/i.test(msg)) {
+      if (useSearch) { noSearch = true; continue; } // search results pushed it over; retry without search
+      throw new Error('This step has too much text for the free AI tier. Shorten the instructions or attached files.');
+    }
+    if (r.status === 429) {
+      const tpd = /per day|TPD|RPD/i.test(msg);
+      const wait = tpd ? 30 * 60000 : Math.max(parseReset(r.headers.get('retry-after')), parseReset(r.headers.get('x-ratelimit-reset-tokens')), 2000);
+      groqCooldown.set(model, Date.now() + wait);
+      if (tpd && GROQ_POOL.every(m => (groqCooldown.get(m) || 0) - Date.now() > 10 * 60000)) throw new Error("Today's free AI quota is used up. Runs resume after the daily limit resets.");
+      continue;
+    }
+    if (r.status >= 500 || r.status === 503) { groqCooldown.set(model, Date.now() + 5000); continue; }
+    if (r.status === 400 && /model/i.test(msg) && /not found|decommission|does not exist/i.test(msg)) { groqCooldown.set(model, Date.now() + 3600000); continue; }
+    throw new Error(`AI provider error (${r.status}): ${clip(msg, 200)}`);
+  }
 }
 
 async function callClaude({ system, user, search, signal }) {
@@ -208,7 +244,7 @@ async function handleRun(req, res, u) {
   let knowledge = '';
   if (d.tools.knowledge) {
     const f = await sql`select name, body from files where agent_id = ${row.id} order by created_at`;
-    let budget = 120000; for (const x of f) { const t = clip(x.body, budget); budget -= t.length; knowledge += `\n--- File: ${x.name} ---\n${t}\n`; if (budget <= 0) break; }
+    let budget = PROVIDER === 'groq' ? 16000 : 120000; for (const x of f) { const t = clip(x.body, budget); budget -= t.length; knowledge += `\n--- File: ${x.name} ---\n${t}\n`; if (budget <= 0) break; }
   }
   const allSources = []; const outputs = []; let status = 'completed', error = null, finalText = '';
   try {
@@ -225,11 +261,11 @@ async function handleRun(req, res, u) {
         last ? 'This is the final step. Produce the finished deliverable for the user in clear Markdown. Cite sources inline when you used web search.' : 'Your output is passed to the next step as working notes. Be concise and factual.',
         'You cannot send messages, make purchases or call external services. If the task needs that, say what you would need instead.',
       ].filter(Boolean).join('\n\n');
-      const user = [`Task from the user:\n${input}`, outputs.length ? `Output of earlier steps:\n${outputs.map((o, k) => `## Step ${k + 1}: ${d.steps[k].title}\n${o}`).join('\n\n')}` : '',
+      const user = [`Task from the user:\n${input}`, outputs.length ? `Output of earlier steps:\n${outputs.map((o, k) => `## Step ${k + 1}: ${d.steps[k].title}\n${PROVIDER === 'groq' && k < outputs.length - 1 ? clip(o, 1200) : PROVIDER === 'groq' ? clip(o, 3500) : o}`).join('\n\n')}` : '',
         `Current step: ${s.title}\n${s.desc}${s.settings.instructions ? `\nStep instructions: ${s.settings.instructions}` : ''}`].filter(Boolean).join('\n\n');
       let attempt = 0, out = null;
       while (true) {
-        try { out = await callAI({ system, user, search: wantSearch, signal: ctrl.signal }); break; }
+        try { out = await callAI({ system, user, search: wantSearch, last, signal: ctrl.signal, onWait: note => { steps[i].note = note; send({ type: 'step', i, step: steps[i] }); } }); break; }
         catch (e) {
           if (ctrl.signal.aborted) throw e;
           if (s.settings.onFail === 'retry' && attempt === 0) { attempt++; steps[i].note = 'Failed once, retrying.'; send({ type: 'step', i, step: steps[i] }); continue; }
@@ -241,7 +277,8 @@ async function handleRun(req, res, u) {
       if (out) {
         outputs.push(out.text || '(no output)'); allSources.push(...out.sources);
         steps[i].status = 'done'; steps[i].endedAt = Date.now(); steps[i].output = clip(out.text, 12000); steps[i].searched = out.sources.length;
-        if (out.sources.length) steps[i].note = `Searched the web · ${out.sources.length} result${out.sources.length === 1 ? '' : 's'}`;
+        steps[i].note = out.sources.length ? `Searched the web · ${out.sources.length} result${out.sources.length === 1 ? '' : 's'}` : (out.note || undefined);
+        if (out.model && out.model !== MODEL) steps[i].note = [steps[i].note, `ran on ${out.model}`].filter(Boolean).join(' · ');
         if (last) finalText = out.text;
         send({ type: 'step', i, step: steps[i] });
       } else outputs.push('(step skipped)');

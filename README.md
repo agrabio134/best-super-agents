@@ -14,6 +14,7 @@ Create, test, publish and manage AI agents through guided steps.
 | `SESSION_SECRET` | yes | Signs session cookies |
 | `GROQ_API_KEY` | one AI key needed | Groq API key (uses `openai/gpt-oss-120b` with built-in browser search) |
 | `GROQ_MODEL` | no | Defaults to `openai/gpt-oss-120b` |
+| `GROQ_MODELS` | no | Comma-separated free-tier rotation pool (default: GROQ_MODEL, openai/gpt-oss-20b, qwen/qwen3.8-27b) |
 | `ANTHROPIC_API_KEY` | one AI key needed | Claude API key |
 | `ANTHROPIC_MODEL` | no | Defaults to `claude-sonnet-5-5` |
 | `AI_PROVIDER` | no | `groq` or `anthropic` when both keys are set (default: anthropic) |
