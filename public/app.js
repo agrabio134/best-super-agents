@@ -205,6 +205,11 @@ async function loadMe({ keepCurrent = true } = {}) {
   const prevCur = cur(); const j = await api('me');
   if (j.setup) { S.setup = true; S.status = j.status; S.user = null; if (!S.agents.length) { const a = newAgent(); S.agents = [a]; S.currentId = a.id; } return; }
   S.setup = false; S.status = j.status; S.user = j.user; S.config = j.config; S.events = j.events; S.rewards = j.rewards;
+  if (!j.user) {
+    S.runs = [];
+    const keep = S.agents.find(a => a.id === S.currentId && !a.persisted && (a.goal || a.name || a.steps.length));
+    const a = keep || readLocal() || newAgent(); S.agents = [a]; S.currentId = a.id; return;
+  }
   const live = S.run?.rec; S.runs = j.runs.map(r => (live && r.id === live.id) ? live : r);
   const local = S.agents.filter(a => !a.persisted && (a.goal || a.name || a.steps.length));
   S.agents = [...j.agents.map(a => ({ ...newAgent(), ...a })), ...local.filter(l => !j.agents.some(a => a.id === l.id))];
@@ -214,6 +219,11 @@ async function loadMe({ keepCurrent = true } = {}) {
   if (prevCur && keepCurrent && !prevCur.persisted && !S.agents.some(a => a.id === prevCur.id)) { S.agents.push(prevCur); S.currentId = prevCur.id; }
 }
 function setCurrent(id) { S.currentId = id; ls.set('bsa-current', id); }
+const signedIn = () => !!S.user?.wallet;
+const LOCAL_KEY = 'bsa-local-draft';
+function saveLocal() { const a = cur(); if (!a || a.persisted) return; try { localStorage.setItem(LOCAL_KEY, JSON.stringify({ ...Object.fromEntries(DATA_KEYS.map(k => [k, a[k]])), id: a.id })); } catch {} }
+function readLocal() { try { const d = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null'); return d && d.id ? { ...newAgent(), ...d, files: [], persisted: false } : null; } catch { return null; } }
+function clearLocal() { try { localStorage.removeItem(LOCAL_KEY); } catch {} }
 
 /* ---------- Saving ---------- */
 let saveTimer = null, savePromise = null;
@@ -227,6 +237,7 @@ async function doSave() {
   const a = cur(); if (!a) return;
   if (S.setup) { S.save = { status: 'error', at: null, error: 'The database is not connected yet.' }; renderSave(); return; }
   if (!a.persisted && !a.goal && !a.name && !a.steps.length) { S.save = { status: 'saved', at: S.save.at, error: null }; renderSave(); return; }
+  if (!signedIn()) { saveLocal(); S.save = { status: 'local', at: null, error: null }; renderSave(); return; }
   S.save.status = 'saving'; renderSave();
   const data = Object.fromEntries(DATA_KEYS.map(k => [k, a[k]]));
   savePromise = (async () => {
@@ -236,7 +247,7 @@ async function doSave() {
   await savePromise; savePromise = null; renderSave();
   if (S.save.status === 'pending') saveTimer = setTimeout(doSave, 400);
 }
-async function flushSave() { if (S.save.status === 'pending' || S.save.status === 'saving' || !cur()?.persisted) await doSave(); if (savePromise) await savePromise; return S.save.status !== 'error'; }
+async function flushSave() { if (!signedIn()) { saveLocal(); return false; } if (S.save.status === 'pending' || S.save.status === 'saving' || S.save.status === 'local' || !cur()?.persisted) await doSave(); if (savePromise) await savePromise; return S.save.status !== 'error' && S.save.status !== 'local'; }
 
 /* ---------- Validation ---------- */
 function validateDefine(a) {
@@ -382,6 +393,7 @@ function renderMain() {
 }
 function setupNote() {
   if (S.setup || !S.status.db) return `<div class="note note-warn" role="note">${ic('alert')}<span><b>Saving is off.</b> The database isn't connected yet, so drafts can't be stored.</span><button class="link-btn" data-act="open-setup">Details</button></div>`;
+  if (!signedIn()) return `<div class="note note-example" role="note">${ic('wallet')}<span><b>Connect your wallet to save.</b> Agents, tests and rewards are stored in your wallet account. Until you connect, this draft stays only in this browser.</span><button class="btn btn-sm btn-dark" data-act="wallet" data-v="save">Connect wallet</button></div>`;
   if (!S.status.ai) return `<div class="note note-warn" role="note">${ic('alert')}<span><b>Test runs are off.</b> The AI provider key hasn't been added yet. You can still build and save agents.</span><button class="link-btn" data-act="open-setup">Details</button></div>`;
   return '';
 }
@@ -538,6 +550,7 @@ function publishView(a) {
 /* ---------- Bar ---------- */
 function saveHTML() {
   const s = S.save;
+  if (!signedIn() && !S.setup) { const a = cur(); return (a && (a.goal || a.name || a.steps.length)) ? `${ic('wallet')}<span>Not saved to an account</span><button class="link-btn" data-act="wallet" data-v="save">Connect wallet to save</button>` : `<span class="muted">Connect a wallet to save</span>`; }
   if (s.status === 'saving') return `<span class="spin" aria-hidden="true"></span><span>Saving…</span>`;
   if (s.status === 'pending') return `<span class="wdot" aria-hidden="true"></span><span>Unsaved changes</span>`;
   if (s.status === 'error') return `${ic('alert', 'ic-bad')}<span class="stxt">Couldn't save. ${esc(s.error)}</span><span class="sr">Couldn't save.</span><button class="link-btn" data-act="save-retry">Retry</button>`;
@@ -665,13 +678,18 @@ function detailView() {
 const allowed = id => ls.get('bsa-allow-' + id) === '1';
 
 /* ---------- My agents / Activity ---------- */
+function signInView(title, text) {
+  return `<div class="wrap wide ${S.routeChanged ? 'enter' : ''}"><div class="page-head"><div><div class="eyebrow">Manage</div><h1 class="h1">${title}</h1></div></div>
+    <div class="empty">${mascot({ size: 64 })}<h3>Connect your wallet</h3><p>${text}</p><div class="row" style="justify-content:center"><button class="btn btn-primary" data-act="wallet" data-v="save">${ic('wallet')} Connect wallet</button><a class="btn" href="#studio">Open Studio</a></div></div></div>`;
+}
 function agentsView() {
+  if (!signedIn()) return signInView('My agents', 'Your drafts, published agents and their test history are saved to your Solana wallet account. Connect to see them on any device.');
   const f = S.agentsFilter; const list = S.agents.filter(a => a.persisted || a.id === S.currentId && (a.goal || a.name));
   const counts = { all: list.length, draft: list.filter(a => a.status === 'draft').length, published: list.filter(a => a.status === 'published').length, paused: list.filter(a => a.status === 'paused').length };
   const shown = list.filter(a => f === 'all' || a.status === f).sort((x, y) => y.updatedAt - x.updatedAt);
   const tests = S.runs.filter(r => r.source === 'Test'); const uses = list.reduce((s, a) => s + (a.uses || 0), 0); const done = list.reduce((s, a) => s + (a.completedByOthers || 0), 0); const pub = counts.published + counts.paused;
   return `<div class="wrap wide ${S.routeChanged ? 'enter' : ''}">
-    <div class="page-head"><div><div class="eyebrow">Manage</div><h1 class="h1">My agents</h1><p class="lede">Drafts and published agents, their tests and how other people use them.${S.user?.wallet ? '' : ' You\'re working as a guest. Connect a wallet to keep your agents across devices.'}</p></div><a class="btn btn-primary" href="#new">${ic('plus')} New agent</a></div>
+    <div class="page-head"><div><div class="eyebrow">Manage</div><h1 class="h1">My agents</h1><p class="lede">Drafts and published agents, their tests and how other people use them.</p></div><a class="btn btn-primary" href="#new">${ic('plus')} New agent</a></div>
     ${!list.length ? `<div class="empty">${mascot({ size: 64 })}<h3>No agents yet</h3><p>Describe a goal in the Studio and your first agent takes shape in four steps: define, configure, test and publish.</p><a class="btn btn-primary" href="#new">${ic('plus')} Create your first agent</a></div>` : `
     <div class="stats" role="group" aria-label="Your numbers"><div class="stat"><span class="k">Agents</span><span class="v">${counts.all}</span><span class="s">${pub} published</span></div>
       <div class="stat"><span class="k">Your test runs</span><span class="v">${tests.length}</span><span class="s">${tests.filter(r => r.status === 'completed').length} completed</span></div>
@@ -696,6 +714,7 @@ function runTable(runs) {
     ${runs.map(r => `<tr><td>${esc(r.agentName || '—')}</td><td><span class="clip" title="${esc(r.input)}">${esc(r.input)}</span>${r.error ? `<span class="muted small">${esc(r.error)}</span>` : ''}</td><td><span class="pill pill-${r.status}">${RUN_LABEL[r.status]}</span></td><td class="mono small">${r.source === 'Test' ? 'Test' : 'Try'}</td><td class="mono small">${fmtDate(r.startedAt)} ${fmtTime(r.startedAt)}</td><td class="mono small">${r.endedAt ? dur(r.endedAt - r.startedAt) : '—'}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function activityView() {
+  if (!signedIn()) return signInView('Activity', 'Your runs and account events are recorded in your wallet account. Connect to see your history.');
   return `<div class="wrap wide ${S.routeChanged ? 'enter' : ''}">
     <div class="page-head"><div><div class="eyebrow">Manage</div><h1 class="h1">Activity</h1><p class="lede">Your execution history and account events.</p></div><a class="btn" href="#agents">${ic('folder')} My agents</a></div>
     <section class="block"><div class="block-head"><h2 class="h2">Execution history</h2><span class="mono muted">${plural(S.runs.length, 'run')}</span></div>
@@ -769,8 +788,9 @@ function renderLayer() {
   if (m.type === 'wallet') {
     const provs = walletProviders(); const W = S.wallet;
     const here = encodeURIComponent(location.href), origin = encodeURIComponent(location.origin);
-    html = dialog({ title: 'Connect a Solana wallet', eyebrowTxt: 'Sign in', body: `
-      <p>Your wallet identifies you as a creator and receives rewards. You'll sign a short message to prove you own it. Signing is free and doesn't send a transaction.</p>
+    const why = { save: ['Save your agent', 'Your agents, test history and rewards are stored in your wallet account, so you can come back to them on any device.'], test: ['Connect to run a test', 'Test runs use the live AI model and are saved to your wallet account with the agent.'], try: ['Connect to run this agent', 'Runs use the live AI model and are saved to your task history.'], publish: ['Connect to publish', 'Your wallet identifies you as the creator and receives any rewards your agent earns.'] }[m.reason] || ['Connect a Solana wallet', 'Your wallet identifies you as a creator, saves your agents and receives rewards.'];
+    html = dialog({ title: why[0], eyebrowTxt: 'Solana wallet', body: `
+      <p>${why[1]} You'll sign a short message to prove you own the wallet. Signing is free and doesn't send a transaction.</p>
       ${W.status === 'error' ? `<div class="note note-bad" role="alert">${ic('alert')}<span>${esc(W.error)}</span></div>` : ''}
       ${W.status === 'connecting' ? `<div class="note" role="status"><span class="spin"></span><span>${esc(W.step || 'Waiting for your wallet…')}</span></div>` : ''}
       ${provs.length ? provs.map(p => `<button class="wopt" data-act="wallet-connect" data-v="${p.key}" ${W.status === 'connecting' ? 'aria-disabled="true"' : ''}>${ic('wallet')}<span><b>${p.name}</b><span class="tag">Detected in this browser</span></span>${ic('arrowR')}</button>`).join('')
@@ -778,7 +798,8 @@ function renderLayer() {
           <a class="wopt" href="https://phantom.app/ul/browse/${here}?ref=${origin}" rel="noopener">${ic('wallet')}<span><b>Open in Phantom</b><span>On a phone, opens this page inside the Phantom app</span></span>${ic('arrowR')}</a>
           <a class="wopt" href="https://solflare.com/ul/v1/browse/${here}?ref=${origin}" rel="noopener">${ic('wallet')}<span><b>Open in Solflare</b><span>On a phone, opens this page inside the Solflare app</span></span>${ic('arrowR')}</a>
           <p class="hint">On a computer, install <a class="link-btn" href="https://phantom.app/download" target="_blank" rel="noopener">Phantom</a> or <a class="link-btn" href="https://solflare.com/download" target="_blank" rel="noopener">Solflare</a>, then reload this page.</p>`}
-      ${S.agents.some(a => a.persisted) && !S.user?.wallet ? '<p class="hint">Agents you made as a guest move into your wallet account when you sign in.</p>' : ''}` });
+      ${!signedIn() && cur() && (cur().goal || cur().name) ? `<p class="hint">Your current draft${cur().name ? ` “${esc(cur().name)}”` : ''} will be saved to your account as soon as you sign in.</p>` : ''}`,
+      foot: m.reason === 'save' ? `<button class="btn btn-ghost" data-act="modal-close">Keep editing without saving</button>` : '' });
   } else if (m.type === 'setup') {
     const st = S.status || {}; const row = (ok, t, d) => `<li><span class="ck ${ok ? 'yes' : 'no'}">${ok ? ic('check') : ''}</span><div><b>${t}</b><p>${d}</p></div></li>`;
     html = dialog({ wide: true, title: 'Service status', eyebrowTxt: 'Live services', body: `<ul class="setup-list">
@@ -863,6 +884,7 @@ function goStage(n) {
       S.errors = e; S.showErrors = true; S.mobileView = 'build'; render(flip); focusFirstError();
       toast(`Finish ${STAGES[i]} first: ${Object.keys(e).length === 1 ? Object.values(e)[0] : plural(Object.keys(e).length, 'item') + ' need attention.'}`, { tone: 'bad' }); return false; }
   }
+  if (!signedIn() && n >= 1 && !S.promptedSave && !S.setup) { S.promptedSave = true; setTimeout(() => openModal({ type: 'wallet', reason: 'save' }), 360); }
   const flip = captureFlip(); a.stage = n; a.maxStage = Math.max(a.maxStage, n); S.errors = {}; S.showErrors = false; S.stageChanged = true; S.editingStep = null; S.menu = null; S.publishError = null; S.mobileView = 'build';
   markDirty(); render(flip); $('#main').scrollTo({ top: 0 }); if (isPhone()) window.scrollTo(0, 0); return true;
 }
@@ -921,6 +943,7 @@ async function startRun(key, agentId, input) {
 async function requestRun(key) {
   const input = (S.chat[key] || '').trim();
   if (!S.status?.ai) { S.runError[key] = { msg: 'Test runs are off until the AI provider key is added. See Service status.' }; render(); return; }
+  if (!signedIn()) { S.chat[key] = S.chat[key] || ''; openModal({ type: 'wallet', reason: key === 'studio' ? 'test' : 'try', then: 'run:' + key }); return; }
   if (key === 'studio') {
     const a = cur(); const e0 = validateDefine(a), e1 = validateConfigure(a);
     if (Object.keys(e0).length || Object.keys(e1).length) { const fix = Object.keys(e0).length ? 0 : 1; const list = Object.values(fix === 0 ? e0 : e1); S.runError.studio = { msg: `Finish ${STAGES[fix]} before testing: ${list[0]}${list.length > 1 ? ` (+${list.length - 1} more)` : ''}`, fix }; render(); return; }
@@ -980,6 +1003,7 @@ async function addFiles(list) {
 async function runUpload(a, f) {
   const ctrl = new AbortController(); uploads.set(f.id, ctrl); Object.assign(f, { status: 'uploading', phase: 'reading', progress: 0, error: null }); render();
   try {
+    if (!signedIn()) throw Object.assign(new Error('Connect your wallet to attach files. Files are stored with your agent in your account.'), { needWallet: true });
     if (!(await flushSave())) throw new Error("The agent couldn't be saved, so the file can't be attached yet.");
     const file = fileObjects.get(f.id); const ext = file.name.split('.').pop().toLowerCase();
     const text = await extractText(file, ext, p => { f.progress = p; updateFileRow(f); });
@@ -990,7 +1014,7 @@ async function runUpload(a, f) {
     fileObjects.delete(f.id); Object.assign(f, { id: r.id, status: 'done', progress: 100 });
   } catch (e) {
     if (e.name === 'AbortError') { a.files = a.files.filter(x => x.id !== f.id); toast(`Upload of “${f.name}” cancelled.`); }
-    else Object.assign(f, { status: 'error', error: e.message, retryable: !e.final });
+    else Object.assign(f, { status: 'error', error: e.message, retryable: !e.final, needWallet: !!e.needWallet });
   }
   uploads.delete(f.id); liveValidate(); render();
 }
@@ -1000,6 +1024,7 @@ function updateFileRow(f) { const el = document.querySelector(`[data-file-id="${
 async function publish() {
   const a = cur(); if (S.publishing) return;
   if (Object.keys({ ...validateDefine(a), ...validateConfigure(a) }).length) { goStage(3); return; }
+  if (!signedIn()) { openModal({ type: 'wallet', reason: 'publish', then: 'publish' }); return; }
   const e = validatePublish(a); if (Object.keys(e).length) { S.errors = e; S.showErrors = true; render(); focusFirstError(); return; }
   S.publishing = true; S.publishError = null; render();
   try {
@@ -1024,9 +1049,16 @@ async function connectWallet(key) {
     S.wallet.step = `Sign the message in ${prov.name}. It's free and sends no transaction.`; render();
     const sres = await prov.p.signMessage(new TextEncoder().encode(message), 'utf8'); const sig = sres?.signature || sres;
     if (!sig || !sig.length) throw new Error('The wallet did not return a signature.');
-    await flushSave();
     await api('auth/verify', { method: 'POST', body: { address, message, signature: b64(new Uint8Array(sig)), token } });
-    await loadMe(); S.wallet = { status: 'idle', error: null }; S.modal = null; pulse('happy'); toast(`Signed in as ${shortAddr(address)}.`, { tone: 'good' }); liveValidate(); render();
+    const local = cur(); const hadLocal = local && !local.persisted && (local.goal || local.name || local.steps.length);
+    S.user = { wallet: address };
+    if (hadLocal) { S.wallet.step = 'Saving your agent to your account…'; render(); S.save.status = 'pending'; await doSave(); if (S.save.status !== 'error') clearLocal(); }
+    const then = S.modal?.then;
+    await loadMe(); S.wallet = { status: 'idle', error: null }; S.modal = null; pulse('happy');
+    toast(hadLocal && S.save.status !== 'error' ? `Signed in as ${shortAddr(address)}. Your agent is saved to your account.` : `Signed in as ${shortAddr(address)}.`, { tone: 'good' }); liveValidate(); render();
+    if (then?.startsWith('run:')) requestRun(then.slice(4));
+    if (then === 'publish') publish();
+    for (const f of (cur()?.files || []).filter(x => x.status === 'error' && x.needWallet)) runUpload(cur(), f);
   } catch (e) {
     const declined = e?.code === 4001 || /reject|declin|cancel|denied/i.test(e?.message || '');
     S.wallet = { status: 'error', error: declined ? 'You declined the request in your wallet. Try again when you are ready.' : (e?.message || 'The wallet connection failed.') }; render();
@@ -1034,7 +1066,7 @@ async function connectWallet(key) {
 }
 async function signOut() {
   if (S.save.status === 'pending') await doSave();
-  try { await api('auth/logout', { method: 'POST' }); for (const p of walletProviders()) { try { await p.p.disconnect?.(); } catch {} } S.agents = []; S.currentId = null; await loadMe({ keepCurrent: false }); toast('Signed out. You are now working as a guest.'); }
+  try { await api('auth/logout', { method: 'POST' }); for (const p of walletProviders()) { try { await p.p.disconnect?.(); } catch {} } S.agents = []; S.currentId = null; S.user = null; clearLocal(); await loadMe({ keepCurrent: false }); toast('Signed out. Connect a wallet to keep working on your agents.'); }
   catch (e) { toast(e.message, { tone: 'bad' }); }
   S.menu = null; render();
 }
@@ -1084,7 +1116,7 @@ const H = {
     try { await navigator.clipboard.writeText(txt); toast('Output copied.', { tone: 'good' }); } catch { toast('Copy was blocked by the browser. Select the text to copy it.', { tone: 'bad' }); } },
   'copy-link': async el => { const u = `${location.origin}/#agent-${el.dataset.id}`; try { await navigator.clipboard.writeText(u); toast('Link copied.', { tone: 'good' }); } catch { toast(u); } },
   'new-agent': () => startNewAgent(),
-  wallet: el => openModal({ type: 'wallet' }, el),
+  wallet: el => openModal({ type: 'wallet', reason: el.dataset.v || '' }, el),
   'wallet-connect': el => connectWallet(el.dataset.v),
   'sign-out': () => signOut(),
   'acct-menu': () => { S.menu = S.menu === 'acct' ? null : 'acct'; render(); if (S.menu) $('.top-right .menu [role="menuitem"]')?.focus(); },

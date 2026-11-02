@@ -70,13 +70,13 @@ function ensureSchema() {
   return schemaReady;
 }
 
-async function getUser(req, res, { create = true } = {}) {
-  let uid = sessionUid(req);
-  if (uid) { const r = await sql`select id, wallet from users where id = ${uid}`; if (r.length) return r[0]; }
-  if (!create) return null;
-  uid = id(); await sql`insert into users(id) values (${uid})`; setSession(res, uid);
-  return { id: uid, wallet: null };
+// Accounts exist only for signed-in Solana wallets. Older guest sessions are read once so their drafts can move into the wallet account.
+async function getUser(req) {
+  const uid = sessionUid(req); if (!uid) return null;
+  const r = await sql`select id, wallet from users where id = ${uid}`; return r[0] || null;
 }
+function clearSession(res) { res.setHeader('set-cookie', 'bsa_s=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'); }
+function needWallet(u) { if (!u?.wallet) throw new HttpError(401, 'Connect your Solana wallet to continue. Your work is saved to your wallet account.'); return u; }
 const isAdmin = u => !!(u?.wallet && ADMIN_WALLETS.includes(u.wallet));
 async function logEvent(uid, text, tone = '') { await sql`insert into events(id, user_id, text, tone) values (${id()}, ${uid}, ${clip(text, 300)}, ${tone})`; }
 async function getConfig() {
@@ -266,11 +266,15 @@ async function route(req, res) {
   if (!SECRET) throw new HttpError(503, 'Server setup incomplete: SESSION_SECRET is missing.');
   if (!sql) { if (p === 'me' || p === 'status') return json(res, 200, { setup: true, status: statusInfo(null) }); throw new HttpError(503, 'The database is not connected yet. Add Neon Postgres to this Vercel project.'); }
   await ensureSchema();
-  const u = await getUser(req, res);
+  const sess = await getUser(req);
+  const u = sess?.wallet ? sess : null;
+  const authed = /^(agents|files|run|admin)(\/|$)/.test(p);
+  if (authed) needWallet(u);
 
   if (p === 'status') return json(res, 200, { status: statusInfo(u) });
 
   if (p === 'me' && m === 'GET') {
+    if (!u) return json(res, 200, { user: null, status: statusInfo(null), config: await getConfig(), agents: [], runs: [], events: [], rewards: [] });
     const agents = await sql`select a.*, (select count(*)::int from runs r where r.agent_id = a.id and r.user_id <> a.owner_id and r.status <> 'cancelled') as uses, (select count(*)::int from runs r where r.agent_id = a.id and r.user_id <> a.owner_id and r.status = 'completed') as completed from agents a where owner_id = ${u.id} order by updated_at desc`;
     const files = await sql`select id, agent_id, name, size, ext, created_at from files where owner_id = ${u.id}`;
     const runs = await sql`select * from runs where user_id = ${u.id} order by started_at desc limit 100`;
@@ -302,25 +306,21 @@ async function route(req, res) {
     try { valid = nacl.sign.detached.verify(new TextEncoder().encode(message), Buffer.from(signature, 'base64'), bs58.decode(address)); } catch {}
     if (!valid) throw new HttpError(401, 'The signature could not be verified. Try again.');
     const ex = await sql`select id from users where wallet = ${address}`;
-    let uid = u.id;
-    if (ex.length && ex[0].id !== u.id) {
-      uid = ex[0].id;
-      if (!u.wallet) { // move this guest's work into the wallet account
-        await sql`update agents set owner_id = ${uid} where owner_id = ${u.id}`;
-        await sql`update files set owner_id = ${uid} where owner_id = ${u.id}`;
-        await sql`update runs set agent_owner = ${uid} where agent_owner = ${u.id}`;
-        await sql`update runs set user_id = ${uid} where user_id = ${u.id}`;
-        await sql`update events set user_id = ${uid} where user_id = ${u.id}`;
-      }
-      setSession(res, uid);
-    } else if (!ex.length) {
-      if (u.wallet) { uid = id(); await sql`insert into users(id, wallet) values (${uid}, ${address})`; setSession(res, uid); }
-      else await sql`update users set wallet = ${address} where id = ${u.id}`;
+    let uid = ex[0]?.id;
+    if (!uid) { uid = id(); await sql`insert into users(id, wallet) values (${uid}, ${address})`; }
+    if (sess && !sess.wallet && sess.id !== uid) { // older guest session: move its drafts into the wallet account
+      await sql`update agents set owner_id = ${uid} where owner_id = ${sess.id}`;
+      await sql`update files set owner_id = ${uid} where owner_id = ${sess.id}`;
+      await sql`update runs set agent_owner = ${uid} where agent_owner = ${sess.id}`;
+      await sql`update runs set user_id = ${uid} where user_id = ${sess.id}`;
+      await sql`update events set user_id = ${uid} where user_id = ${sess.id}`;
+      await sql`delete from users where id = ${sess.id} and wallet is null`;
     }
+    setSession(res, uid);
     await logEvent(uid, `Signed in with wallet ${address.slice(0, 4)}…${address.slice(-4)}`, 'good');
     return json(res, 200, { ok: true });
   }
-  if (p === 'auth/logout' && m === 'POST') { const nid = id(); await sql`insert into users(id) values (${nid})`; setSession(res, nid); return json(res, 200, { ok: true }); }
+  if (p === 'auth/logout' && m === 'POST') { clearSession(res); return json(res, 200, { ok: true }); }
 
   /* Agents */
   if (parts[0] === 'agents' && isId(parts[1])) {
@@ -398,14 +398,14 @@ async function route(req, res) {
   /* Discover */
   if (p === 'directory' && m === 'GET') {
     const rows = await sql`select a.id, a.data, a.owner_id, a.published_at, us.wallet, (select count(*)::int from runs r where r.agent_id = a.id and r.user_id <> a.owner_id and r.status = 'completed') as completed from agents a join users us on us.id = a.owner_id where a.status = 'published' and a.data->>'visibility' = 'public' order by a.published_at desc limit 200`;
-    return json(res, 200, { agents: rows.map(r => ({ id: r.id, name: r.data.name, cat: r.data.category, purpose: r.data.description || r.data.goal, access: r.data.access, creator: r.wallet, completed: r.completed, mine: r.owner_id === u.id, publishedAt: new Date(r.published_at).getTime() })) });
+    return json(res, 200, { agents: rows.map(r => ({ id: r.id, name: r.data.name, cat: r.data.category, purpose: r.data.description || r.data.goal, access: r.data.access, creator: r.wallet, completed: r.completed, mine: !!u && r.owner_id === u.id, publishedAt: new Date(r.published_at).getTime() })) });
   }
   if (parts[0] === 'directory' && isId(parts[1]) && m === 'GET') {
     const r = await sql`select a.id, a.data, a.status, a.owner_id, us.wallet from agents a join users us on us.id = a.owner_id where a.id = ${parts[1]}`; const a = r[0];
     if (!a || a.status === 'draft' || a.data.visibility === 'private') throw new HttpError(404, 'This agent is not available.');
-    const runs = await sql`select * from runs where agent_id = ${a.id} and user_id = ${u.id} order by started_at desc limit 20`;
+    const runs = u ? await sql`select * from runs where agent_id = ${a.id} and user_id = ${u.id} order by started_at desc limit 20` : [];
     const d = a.data;
-    return json(res, 200, { agent: { id: a.id, name: d.name, cat: d.category, goal: d.goal, purpose: d.description, access: d.access, creator: a.wallet, status: a.status, mine: a.owner_id === u.id,
+    return json(res, 200, { agent: { id: a.id, name: d.name, cat: d.category, goal: d.goal, purpose: d.description, access: d.access, creator: a.wallet, status: a.status, mine: !!u && a.owner_id === u.id,
       tools: Object.keys(d.tools).filter(k => d.tools[k]), askBeforeSend: d.perms.askBeforeSend, keepHistory: d.perms.keepHistory, template: d.template,
       steps: d.steps.map(s => ({ id: s.id, kind: s.kind, title: s.title, desc: s.desc })) }, runs: runs.map(shapeRun).reverse() });
   }
