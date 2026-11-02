@@ -774,14 +774,57 @@ function dialog({ title, eyebrowTxt = '', body, foot = '', wide = false, sheet =
     <header class="m-head"><div>${eyebrowTxt ? `<span class="eyebrow">${eyebrowTxt}</span>` : ''}<h2 id="m-title">${title}</h2></div><button class="icon-btn" data-act="modal-close" aria-label="Close">${ic('x')}</button></header>
     <div class="m-body">${body}</div>${foot ? `<footer class="m-foot">${foot}</footer>` : ''}</div></div>`;
 }
+/* ---------- Solana wallets ----------
+   1) Wallet Standard (Phantom, Solflare, Backpack, OKX, Bitget, Coinbase, Trust, Magic Eden, Glow, Exodus and others)
+   2) Older injected providers, for wallets that don't register through the standard yet */
+const stdWallets = [];
+(function initWalletStandard() {
+  const reg = { register: (...ws) => { for (const w of ws) if (!stdWallets.includes(w)) stdWallets.push(w); if (S.modal?.type === 'wallet') renderLayer(); return () => {}; } };
+  try { window.addEventListener('wallet-standard:register-wallet', e => { try { e.detail(reg); } catch {} }); window.dispatchEvent(new CustomEvent('wallet-standard:app-ready', { detail: reg })); } catch {}
+})();
+const LEGACY = [
+  ['phantom', 'Phantom', () => window.phantom?.solana?.isPhantom && window.phantom.solana],
+  ['solflare', 'Solflare', () => window.solflare?.isSolflare && window.solflare],
+  ['backpack', 'Backpack', () => window.backpack?.signMessage && window.backpack],
+  ['okx', 'OKX Wallet', () => window.okxwallet?.solana],
+  ['bitget', 'Bitget Wallet', () => window.bitkeep?.solana],
+  ['coinbase', 'Coinbase Wallet', () => window.coinbaseSolana],
+  ['trust', 'Trust Wallet', () => window.trustwallet?.solana],
+  ['magiceden', 'Magic Eden', () => window.magicEden?.solana],
+  ['glow', 'Glow', () => window.glowSolana],
+  ['exodus', 'Exodus', () => window.exodus?.solana],
+];
+const slug = n => String(n).toLowerCase().replace(/wallet|[^a-z0-9]/g, '');
 function walletProviders() {
-  const w = window, list = [];
-  if (w.phantom?.solana?.isPhantom) list.push({ key: 'phantom', name: 'Phantom', p: w.phantom.solana });
-  if (w.solflare?.isSolflare) list.push({ key: 'solflare', name: 'Solflare', p: w.solflare });
-  if (w.backpack?.isBackpack || (w.backpack && w.backpack.signMessage)) list.push({ key: 'backpack', name: 'Backpack', p: w.backpack });
-  if (!list.length && w.solana?.signMessage) list.push({ key: 'solana', name: 'Solana wallet', p: w.solana });
+  const list = []; const seen = new Set();
+  for (const w of stdWallets) {
+    const f = w.features || {};
+    if (!f['standard:connect'] || !f['solana:signMessage'] || !(w.chains || []).some(c => String(c).startsWith('solana:'))) continue;
+    const k = slug(w.name); if (seen.has(k)) continue; seen.add(k);
+    list.push({ key: 'std:' + k, name: w.name, icon: w.icon, kind: 'std', w });
+  }
+  for (const [k, name, get] of LEGACY) { let p = null; try { p = get(); } catch {} if (!p || seen.has(slug(name))) continue; seen.add(slug(name)); list.push({ key: 'legacy:' + k, name, kind: 'legacy', p }); }
+  if (!list.length && window.solana?.signMessage) list.push({ key: 'legacy:solana', name: 'Solana wallet', kind: 'legacy', p: window.solana });
   return list;
 }
+async function walletConnect(prov) {
+  if (prov.kind === 'std') { const r = await prov.w.features['standard:connect'].connect(); const acc = (r?.accounts || prov.w.accounts || []).find(a => (a.chains || ['solana:']).some(c => String(c).startsWith('solana:'))) || (r?.accounts || prov.w.accounts || [])[0]; if (!acc) throw new Error('The wallet did not share an address.'); prov.account = acc; return acc.address; }
+  const r = await prov.p.connect(); const pk = r?.publicKey || prov.p.publicKey; if (!pk) throw new Error('The wallet did not share an address.'); return pk.toBase58 ? pk.toBase58() : pk.toString();
+}
+async function walletSign(prov, bytes) {
+  if (prov.kind === 'std') { const out = await prov.w.features['solana:signMessage'].signMessage({ account: prov.account, message: bytes }); const o = Array.isArray(out) ? out[0] : out; return o?.signature; }
+  const r = await prov.p.signMessage(bytes, 'utf8'); return r?.signature || r;
+}
+async function walletDisconnect(prov) { try { if (prov.kind === 'std') await prov.w.features['standard:disconnect']?.disconnect(); else await prov.p.disconnect?.(); } catch {} }
+const MOBILE_WALLETS = [
+  ['Phantom', u => `https://phantom.app/ul/browse/${encodeURIComponent(u)}?ref=${encodeURIComponent(location.origin)}`],
+  ['Solflare', u => `https://solflare.com/ul/v1/browse/${encodeURIComponent(u)}?ref=${encodeURIComponent(location.origin)}`],
+  ['OKX Wallet', u => `https://web3.okx.com/download?deeplink=${encodeURIComponent('okx://wallet/dapp/url?dappUrl=' + encodeURIComponent(u))}`],
+  ['Backpack', u => `https://backpack.app/ul/v1/browse/${encodeURIComponent(u)}?ref=${encodeURIComponent(location.origin)}`],
+  ['Bitget Wallet', u => `https://bkcode.vip?action=dapp&url=${encodeURIComponent(u)}`],
+];
+window.__bsaWalletIc = ic('wallet');
+const walletIcon = p => p.icon && /^data:image\/(svg\+xml|png|webp|jpeg)/.test(p.icon) ? `<img src="${esc(p.icon)}" alt="" width="28" height="28" style="border-radius:8px;flex:none" onerror="this.replaceWith(document.createRange().createContextualFragment(window.__bsaWalletIc))">` : ic('wallet');
 function renderLayer() {
   const m = S.modal; const L = $('#layer'); if (!m) { L.innerHTML = ''; return; }
   let html = '';
@@ -793,11 +836,8 @@ function renderLayer() {
       <p>${why[1]} You'll sign a short message to prove you own the wallet. Signing is free and doesn't send a transaction.</p>
       ${W.status === 'error' ? `<div class="note note-bad" role="alert">${ic('alert')}<span>${esc(W.error)}</span></div>` : ''}
       ${W.status === 'connecting' ? `<div class="note" role="status"><span class="spin"></span><span>${esc(W.step || 'Waiting for your wallet…')}</span></div>` : ''}
-      ${provs.length ? provs.map(p => `<button class="wopt" data-act="wallet-connect" data-v="${p.key}" ${W.status === 'connecting' ? 'aria-disabled="true"' : ''}>${ic('wallet')}<span><b>${p.name}</b><span class="tag">Detected in this browser</span></span>${ic('arrowR')}</button>`).join('')
-        : `<div class="note">${ic('info')}<span>No Solana wallet was found in this browser.</span></div>
-          <a class="wopt" href="https://phantom.app/ul/browse/${here}?ref=${origin}" rel="noopener">${ic('wallet')}<span><b>Open in Phantom</b><span>On a phone, opens this page inside the Phantom app</span></span>${ic('arrowR')}</a>
-          <a class="wopt" href="https://solflare.com/ul/v1/browse/${here}?ref=${origin}" rel="noopener">${ic('wallet')}<span><b>Open in Solflare</b><span>On a phone, opens this page inside the Solflare app</span></span>${ic('arrowR')}</a>
-          <p class="hint">On a computer, install <a class="link-btn" href="https://phantom.app/download" target="_blank" rel="noopener">Phantom</a> or <a class="link-btn" href="https://solflare.com/download" target="_blank" rel="noopener">Solflare</a>, then reload this page.</p>`}
+      ${provs.length ? `<p class="hint">Wallets found in this browser:</p>` + provs.map(p => `<button class="wopt" data-act="wallet-connect" data-v="${esc(p.key)}" ${W.status === 'connecting' ? 'aria-disabled="true"' : ''}>${walletIcon(p)}<span><b>${esc(p.name)}</b><span class="tag">Detected</span></span>${ic('arrowR')}</button>`).join('') : `<div class="note">${ic('info')}<span>No Solana wallet was found in this browser. On a computer, install a wallet extension such as Phantom, OKX Wallet, Solflare or Backpack, then reload this page.</span></div>`}
+      <details class="how"><summary>${provs.length ? 'Using a phone? Open in your wallet app' : 'On a phone? Open this page in your wallet app'}</summary><div class="block tight" style="padding-bottom:14px">${MOBILE_WALLETS.map(([n, f]) => `<a class="wopt" href="${esc(f(location.href))}" rel="noopener">${ic('wallet')}<span><b>Open in ${n}</b><span>Opens this page in the ${n} in-app browser</span></span>${ic('arrowR')}</a>`).join('')}</div></details>
       ${!signedIn() && cur() && (cur().goal || cur().name) ? `<p class="hint">Your current draft${cur().name ? ` “${esc(cur().name)}”` : ''} will be saved to your account as soon as you sign in.</p>` : ''}`,
       foot: m.reason === 'save' ? `<button class="btn btn-ghost" data-act="modal-close">Keep editing without saving</button>` : '' });
   } else if (m.type === 'setup') {
@@ -1043,11 +1083,10 @@ async function connectWallet(key) {
   const prov = walletProviders().find(p => p.key === key); if (!prov || S.wallet.status === 'connecting') return;
   S.wallet = { status: 'connecting', step: `Approve the connection in ${prov.name}…` }; render();
   try {
-    const r = await prov.p.connect(); const pk = r?.publicKey || prov.p.publicKey; if (!pk) throw new Error('The wallet did not share an address.');
-    const address = pk.toBase58 ? pk.toBase58() : pk.toString();
+    const address = await walletConnect(prov);
     const { message, token } = await api('auth/nonce', { method: 'POST', body: { address } });
     S.wallet.step = `Sign the message in ${prov.name}. It's free and sends no transaction.`; render();
-    const sres = await prov.p.signMessage(new TextEncoder().encode(message), 'utf8'); const sig = sres?.signature || sres;
+    const sig = await walletSign(prov, new TextEncoder().encode(message));
     if (!sig || !sig.length) throw new Error('The wallet did not return a signature.');
     await api('auth/verify', { method: 'POST', body: { address, message, signature: b64(new Uint8Array(sig)), token } });
     const local = cur(); const hadLocal = local && !local.persisted && (local.goal || local.name || local.steps.length);
@@ -1066,7 +1105,7 @@ async function connectWallet(key) {
 }
 async function signOut() {
   if (S.save.status === 'pending') await doSave();
-  try { await api('auth/logout', { method: 'POST' }); for (const p of walletProviders()) { try { await p.p.disconnect?.(); } catch {} } S.agents = []; S.currentId = null; S.user = null; clearLocal(); await loadMe({ keepCurrent: false }); toast('Signed out. Connect a wallet to keep working on your agents.'); }
+  try { await api('auth/logout', { method: 'POST' }); for (const p of walletProviders()) await walletDisconnect(p); S.agents = []; S.currentId = null; S.user = null; clearLocal(); await loadMe({ keepCurrent: false }); toast('Signed out. Connect a wallet to keep working on your agents.'); }
   catch (e) { toast(e.message, { tone: 'bad' }); }
   S.menu = null; render();
 }
